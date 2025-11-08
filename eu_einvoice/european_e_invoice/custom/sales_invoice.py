@@ -26,6 +26,7 @@ from eu_einvoice.utils import EInvoiceProfile, get_drafthorse_schema, get_guidel
 if TYPE_CHECKING:
 	from erpnext.accounts.doctype.sales_invoice.sales_invoice import SalesInvoice
 	from erpnext.accounts.doctype.sales_invoice_item.sales_invoice_item import SalesInvoiceItem
+	from erpnext.selling.doctype.customer.customer import Customer
 	from erpnext.setup.doctype.company.company import Company
 	from frappe.contacts.doctype.address.address import Address
 	from frappe.contacts.doctype.contact.contact import Contact
@@ -74,6 +75,7 @@ def get_einvoice(invoice: str | SalesInvoice) -> bytes:
 	if invoice.contact_person:
 		buyer_contact = frappe.get_doc("Contact", invoice.contact_person)
 
+	customer = frappe.get_doc("Customer", invoice.customer)
 	company = frappe.get_doc("Company", invoice.company)
 
 	profile = EInvoiceProfile(invoice.einvoice_profile)
@@ -81,6 +83,7 @@ def get_einvoice(invoice: str | SalesInvoice) -> bytes:
 		profile=profile,
 		invoice=invoice,
 		company=company,
+		customer=customer,
 		seller_address=seller_address,
 		buyer_address=buyer_address,
 		shipping_address=shipping_address,
@@ -103,6 +106,7 @@ class EInvoiceGenerator:
 		profile: EInvoiceProfile,
 		invoice: SalesInvoice,
 		company: Company,
+		customer: Customer,
 		seller_address: Address | None = None,
 		buyer_address: Address | None = None,
 		shipping_address: Address | None = None,
@@ -112,6 +116,7 @@ class EInvoiceGenerator:
 		self.profile = profile
 		self.invoice = invoice
 		self.company = company
+		self.customer = customer
 		self.seller_address = seller_address
 		self.buyer_address = buyer_address
 		self.shipping_address = shipping_address
@@ -254,8 +259,15 @@ class EInvoiceGenerator:
 		if self.profile > EInvoiceProfile.BASIC:
 			self._set_seller_contact()
 
+		self._set_seller_id()
 		self._set_seller_electronic_address()
 		self._set_seller_address()
+
+	def _set_seller_id(self):
+		for row in self.customer.supplier_numbers:
+			if row.company == self.invoice.company and row.supplier_number:
+				self.doc.trade.agreement.seller.id = row.supplier_number
+				break
 
 	def _set_seller_tax_id(self):
 		if not self.invoice.company_tax_id:
@@ -287,6 +299,13 @@ class EInvoiceGenerator:
 		).upper()
 
 	def _set_seller_electronic_address(self):
+		if self.company.electronic_address_scheme and self.company.electronic_address:
+			self.doc.trade.agreement.seller.electronic_address.uri_ID = (
+				frappe.db.get_value("Common Code", self.company.electronic_address_scheme, "common_code"),
+				self.company.electronic_address,
+			)
+			return
+
 		if self.seller_contact and self.seller_contact.email_id:
 			electronic_address = self.seller_contact.email_id
 		else:
@@ -324,12 +343,21 @@ class EInvoiceGenerator:
 		if self.profile > EInvoiceProfile.BASIC:
 			self._set_buyer_contact()
 
+		self._set_buyer_electronic_address()
+		self._set_buyer_tax_id()
+
+	def _set_buyer_electronic_address(self):
+		if self.customer.electronic_address_scheme and self.customer.electronic_address:
+			self.doc.trade.agreement.buyer.electronic_address.uri_ID = (
+				frappe.db.get_value("Common Code", self.customer.electronic_address_scheme, "common_code"),
+				self.customer.electronic_address,
+			)
+			return
+
 		if self.invoice.contact_email:
 			self.doc.trade.agreement.buyer.electronic_address.uri_ID = ("EM", self.invoice.contact_email)
-		elif self.buyer_address.email_id:
+		elif self.buyer_address and self.buyer_address.email_id:
 			self.doc.trade.agreement.buyer.electronic_address.uri_ID = ("EM", self.buyer_address.email_id)
-
-		self._set_buyer_tax_id()
 
 	def _set_buyer_tax_id(self):
 		if not self.invoice.tax_id:
@@ -364,6 +392,9 @@ class EInvoiceGenerator:
 		if not self.shipping_address:
 			return
 
+		self.doc.trade.delivery.ship_to.name = (
+			self.shipping_address.address_title or self.invoice.customer_name
+		)
 		self.doc.trade.delivery.ship_to.address.line_one = self.shipping_address.address_line1
 		self.doc.trade.delivery.ship_to.address.line_two = self.shipping_address.address_line2
 		self.doc.trade.delivery.ship_to.address.postcode = self.shipping_address.pincode
@@ -373,18 +404,18 @@ class EInvoiceGenerator:
 		).upper()
 
 	def _set_buyer_contact(self):
-		buyer_contact_phone = self.invoice.contact_mobile
 		if self.buyer_contact:
 			self.doc.trade.agreement.buyer.contact.person_name = self.buyer_contact.full_name
 			if self.buyer_contact.department:
 				self.doc.trade.agreement.buyer.contact.department_name = self.buyer_contact.department
-			if self.buyer_contact.phone:
-				buyer_contact_phone = self.buyer_contact.phone
-			if self.invoice.contact_email:
-				self.doc.trade.agreement.buyer.contact.email.address = self.invoice.contact_email
+			if self.buyer_contact.email_id:
+				self.doc.trade.agreement.buyer.contact.email.address = self.buyer_contact.email_id
 
-		if buyer_contact_phone and self.profile >= EInvoiceProfile.EN16931:
-			self.doc.trade.agreement.buyer.contact.telephone.number = buyer_contact_phone
+			if self.profile >= EInvoiceProfile.EN16931:
+				if self.buyer_contact.phone:
+					self.doc.trade.agreement.buyer.contact.telephone.number = self.buyer_contact.phone
+				elif self.buyer_contact.mobile_no:
+					self.doc.trade.agreement.buyer.contact.telephone.number = self.buyer_contact.mobile_no
 
 	def _add_line_item(self, item: SalesInvoiceItem):
 		li = LineItem()
@@ -772,7 +803,9 @@ def validate_einvoice(doc: SalesInvoice):
 	try:
 		xml_string = get_einvoice(doc).decode()
 	except Exception:
-		doc.validation_errors = _("Cannot create E Invoice.")
+		msg = _("Cannot create E Invoice.")
+		doc.validation_errors = msg
+		frappe.log_error(msg, reference_doctype=doc.doctype, reference_name=doc.name)
 		return
 
 	try:
@@ -784,7 +817,9 @@ def validate_einvoice(doc: SalesInvoice):
 			validation_errors += basic_errors
 			warnings += basic_warnings
 	except Exception:
-		doc.validation_errors = _("Cannot validate E Invoice schematron.")
+		msg = _("Cannot validate E Invoice schematron.")
+		doc.validation_errors = msg
+		frappe.log_error(msg, reference_doctype=doc.doctype, reference_name=doc.name)
 		return
 
 	if any(validation_errors):
